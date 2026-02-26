@@ -1,70 +1,128 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from datetime import datetime
+import os
 import sqlite3
-import hashlib
-import json
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request, Form, Depends, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt
+from passlib.context import CryptContext
+from fastapi.templating import Jinja2Templates
 
 app = FastAPI()
 
-# Load or generate RSA private key
-with open("private_key.pem", "rb") as f:
-    private_key = load_pem_private_key(f.read(), password=None)
+# ---------- CONFIG ----------
+SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "dev_secret")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
 
 DB = "licenses.db"
 
-class LicenseRequest(BaseModel):
-    key: str
-    hwid: str
+security = HTTPBearer()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+templates = Jinja2Templates(directory="templates")
 
-def get_license(key):
+# ---------- DATABASE INIT ----------
+def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("SELECT key, expires, hwid FROM licenses WHERE key=?", (key,))
-    result = c.fetchone()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            key TEXT PRIMARY KEY,
+            expires TEXT,
+            hwid TEXT
+        )
+    """)
+    conn.commit()
     conn.close()
-    return result
 
-@app.post("/validate")
-def validate_license(data: LicenseRequest):
-    record = get_license(data.key)
+init_db()
 
-    if not record:
-        return {"valid": False}
+# ---------- AUTH ----------
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-    key, expires, stored_hwid = record
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-    if datetime.strptime(expires, "%Y-%m-%d") < datetime.utcnow():
-        return {"valid": False}
+# ---------- LOGIN PAGE ----------
+@app.get("/admin", response_class=HTMLResponse)
+def login_page(request: Request):
+    return templates.TemplateResponse("login.html", {"request": request})
 
-    if stored_hwid and stored_hwid != data.hwid:
-        return {"valid": False}
+@app.post("/admin/login")
+def login(username: str = Form(...), password: str = Form(...)):
+    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+        return RedirectResponse("/admin", status_code=302)
 
-    if not stored_hwid:
-        conn = sqlite3.connect(DB)
-        c = conn.cursor()
-        c.execute("UPDATE licenses SET hwid=? WHERE key=?", (data.hwid, data.key))
-        conn.commit()
-        conn.close()
+    token = create_access_token({"sub": username})
+    response = RedirectResponse("/admin/dashboard", status_code=302)
+    response.set_cookie("token", token)
+    return response
 
-    payload = {
-        "valid": True,
-        "expires": expires
-    }
+# ---------- DASHBOARD ----------
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+def dashboard(request: Request):
+    token = request.cookies.get("token")
+    if not token:
+        return RedirectResponse("/admin")
 
-    message = json.dumps(payload).encode()
+    try:
+        jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except:
+        return RedirectResponse("/admin")
 
-    signature = private_key.sign(
-        message,
-        padding.PKCS1v15(),
-        hashes.SHA256()
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses")
+    keys = c.fetchall()
+    conn.close()
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "keys": keys}
     )
 
-    return {
-        "data": payload,
-        "signature": signature.hex()
-    }
+# ---------- ADD KEY ----------
+@app.post("/admin/add")
+def add_key(request: Request, key: str = Form(...), days: int = Form(...)):
+    token = request.cookies.get("token")
+    if not token:
+        return RedirectResponse("/admin")
+
+    expires = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO licenses (key, expires, hwid) VALUES (?, ?, ?)",
+        (key, expires, None)
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/admin/dashboard", status_code=302)
+
+# ---------- REMOVE KEY ----------
+@app.post("/admin/remove")
+def remove_key(request: Request, key: str = Form(...)):
+    token = request.cookies.get("token")
+    if not token:
+        return RedirectResponse("/admin")
+
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("DELETE FROM licenses WHERE key=?", (key,))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse("/admin/dashboard", status_code=302)
