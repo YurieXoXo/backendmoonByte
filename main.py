@@ -1,22 +1,40 @@
 import os
 import sqlite3
+import json
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 from jose import jwt
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 
 app = FastAPI()
 
-# ---------- CONFIG ----------
+# ================= CONFIG =================
+
 SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "dev_secret")
 ALGORITHM = "HS256"
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password")
 
+PRIVATE_KEY_PEM = os.getenv("PRIVATE_KEY", "").encode()
+
+if not PRIVATE_KEY_PEM:
+    raise RuntimeError("PRIVATE_KEY environment variable not set")
+
+private_key = serialization.load_pem_private_key(
+    PRIVATE_KEY_PEM,
+    password=None,
+    backend=default_backend()
+)
+
 DB = "licenses.db"
 
-# ---------- DATABASE ----------
+# ================= DATABASE =================
+
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
@@ -32,7 +50,8 @@ def init_db():
 
 init_db()
 
-# ---------- TOKEN ----------
+# ================= ADMIN AUTH =================
+
 def create_token(username: str):
     expire = datetime.utcnow() + timedelta(hours=2)
     return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
@@ -44,7 +63,8 @@ def verify_token(token: str):
     except:
         return False
 
-# ---------- LOGIN PAGE ----------
+# ================= ADMIN LOGIN PAGE =================
+
 @app.get("/admin", response_class=HTMLResponse)
 def login_page():
     return """
@@ -63,10 +83,11 @@ def login(username: str = Form(...), password: str = Form(...)):
 
     token = create_token(username)
     response = RedirectResponse("/admin/dashboard", status_code=302)
-    response.set_cookie("token", token)
+    response.set_cookie("token", token, httponly=True)
     return response
 
-# ---------- DASHBOARD ----------
+# ================= ADMIN DASHBOARD =================
+
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request):
     token = request.cookies.get("token")
@@ -85,7 +106,7 @@ def dashboard(request: Request):
         <tr>
             <td>{k[0]}</td>
             <td>{k[1]}</td>
-            <td>{k[2]}</td>
+            <td>{k[2] or ""}</td>
             <td>
                 <form method="post" action="/admin/remove">
                     <input type="hidden" name="key" value="{k[0]}">
@@ -117,7 +138,6 @@ def dashboard(request: Request):
     </table>
     """
 
-# ---------- ADD KEY ----------
 @app.post("/admin/add")
 def add_key(request: Request, key: str = Form(...), days: int = Form(...)):
     token = request.cookies.get("token")
@@ -130,14 +150,13 @@ def add_key(request: Request, key: str = Form(...), days: int = Form(...)):
     c = conn.cursor()
     c.execute(
         "INSERT OR REPLACE INTO licenses (key, expires, hwid) VALUES (?, ?, ?)",
-        (key, expires, None)
+        (key.strip(), expires, None)
     )
     conn.commit()
     conn.close()
 
     return RedirectResponse("/admin/dashboard", status_code=302)
 
-# ---------- REMOVE KEY ----------
 @app.post("/admin/remove")
 def remove_key(request: Request, key: str = Form(...)):
     token = request.cookies.get("token")
@@ -146,8 +165,58 @@ def remove_key(request: Request, key: str = Form(...)):
 
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute("DELETE FROM licenses WHERE key=?", (key,))
+    c.execute("DELETE FROM licenses WHERE key=?", (key.strip(),))
     conn.commit()
     conn.close()
 
     return RedirectResponse("/admin/dashboard", status_code=302)
+
+# ================= USER VALIDATION =================
+
+class LicenseRequest(BaseModel):
+    key: str
+    hwid: str
+
+@app.post("/validate")
+def validate_license(data: LicenseRequest):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT key, expires, hwid FROM licenses WHERE key=?", (data.key.strip(),))
+    record = c.fetchone()
+    conn.close()
+
+    if not record:
+        return {"valid": False}
+
+    key, expires, stored_hwid = record
+
+    if datetime.strptime(expires, "%Y-%m-%d") < datetime.utcnow():
+        return {"valid": False}
+
+    # HWID binding
+    if not stored_hwid:
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("UPDATE licenses SET hwid=? WHERE key=?", (data.hwid, data.key))
+        conn.commit()
+        conn.close()
+    elif stored_hwid != data.hwid:
+        return {"valid": False}
+
+    payload = {
+        "valid": True,
+        "expires": expires
+    }
+
+    message = json.dumps(payload).encode()
+
+    signature = private_key.sign(
+        message,
+        padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+
+    return {
+        "data": payload,
+        "signature": signature.hex()
+    }
