@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 cryptography
+python-jose
+passlib[bcrypt]
